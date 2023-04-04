@@ -8,14 +8,17 @@ import (
 )
 
 type task struct {
-	key      string
-	expireAt time.Time
-	job      func()
+	key          string
+	expireAt     time.Time
+	job          func()
+	currentLevel int
 }
+
 type taskLocation struct {
 	elem *list.Element
-	slot uint32
+	slot int64
 }
+
 type bucket struct {
 	bucketLock sync.Mutex
 	list       *list.List
@@ -23,30 +26,157 @@ type bucket struct {
 
 type Wheel struct {
 	currentDuration time.Duration
-	current         uint32
+	current         int64
 	interval        time.Duration
-	ticker          *time.Ticker
+	maxDuration     time.Duration
 	slots           []*bucket
-	slotsNum        uint32
+	slotsNum        int64
+	name            string
 }
 
 type TimeWheel struct {
-	mswheel       *Wheel
-	swheel        *Wheel
-	mwheel        *Wheel
-	hwheel        *Wheel
+	wheels        []*Wheel
 	addC          chan *task
+	ticker        *time.Ticker
 	removeC       chan string
 	stopC         chan struct{}
 	taskLocations map[string]*taskLocation
+}
+
+func doJob(t *task) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Println("任务执行失败", err)
+		}
+	}()
+	t.job()
+}
+
+func (tw *TimeWheel) add(t *task) {
+	milliseconds := t.expireAt.Sub(time.Now()).Milliseconds()
+	for _, w := range tw.wheels {
+		if milliseconds > w.maxDuration.Milliseconds() {
+			t.currentLevel++
+		} else {
+			break
+		}
+	}
+	tw.addTaskToWheel(t, tw.wheels[t.currentLevel])
+}
+
+func (tw *TimeWheel) addTaskToWheel(t *task, wheel *Wheel) {
+	slot := (t.expireAt.UnixMilli() - time.Now().UnixMilli()) / wheel.interval.Milliseconds()
+	position := (wheel.current + slot) % wheel.slotsNum
+	wheel.slots[position].bucketLock.Lock()
+	elem := wheel.slots[position].list.PushBack(t)
+	wheel.slots[position].bucketLock.Unlock()
+	tw.taskLocations[t.key] = &taskLocation{
+		elem: elem,
+		slot: position,
+	}
+}
+
+func (tw *TimeWheel) handleTick() {
+	for _, w := range tw.wheels {
+		w.current = (w.current + 1) % w.slotsNum
+		bucket := w.slots[w.current]
+		if bucket.list.Len() == 0 {
+			continue
+		}
+		front := bucket.list.Front()
+		if front != nil {
+			tk := front.Value.(*task)
+			if tk.currentLevel == 0 || tk.expireAt.UnixMilli() <= time.Now().UnixMilli() {
+				for front != nil {
+					t := front.Value.(*task)
+					if t.expireAt.UnixMilli() <= time.Now().UnixMilli() {
+						doJob(t)
+						next := front.Next()
+						bucket.list.Remove(front)
+						front = next
+						delete(tw.taskLocations, t.key)
+					} else {
+						break
+					}
+				}
+			} else {
+				nextWheel := tw.wheels[tk.currentLevel-1]
+				nextSlot := (tk.expireAt.UnixMilli() - time.Now().UnixMilli()) / nextWheel.interval.Milliseconds()
+				nextPosition := (w.current + nextSlot) % nextWheel.slotsNum
+				currentSlot := tw.taskLocations[tk.key].slot
+				currentBucket := w.slots[currentSlot]
+				nextWheel.slots[nextPosition].list.PushBackList(currentBucket.list)
+				currentBucket.list.Init()
+				tw.taskLocations[tk.key].slot = nextPosition
+				tk.currentLevel--
+			}
+		}
+		if w.current == 0 {
+			continue
+		}
+		break
+	}
+}
+
+func (tw *TimeWheel) stop() {
+	tw.ticker.Stop()
+	close(tw.addC)
+	close(tw.removeC)
+	close(tw.stopC)
+}
+
+func NewWheel(interval time.Duration, slotsNum int64, name string) *Wheel {
+	w := &Wheel{
+		interval:        interval,
+		slots:           make([]*bucket, slotsNum),
+		slotsNum:        slotsNum,
+		currentDuration: 0,
+		current:         0,
+		name:            name,
+		maxDuration:     interval * time.Duration(slotsNum),
+	}
+	for i := range w.slots {
+		w.slots[i] = &bucket{
+			list: list.New(),
+		}
+	}
+	return w
+}
+
+func NewTimeWheel() *TimeWheel {
+	t := &TimeWheel{
+		ticker:        time.NewTicker(1 * time.Millisecond),
+		wheels:        make([]*Wheel, 4),
+		addC:          make(chan *task),
+		removeC:       make(chan string),
+		stopC:         make(chan struct{}),
+		taskLocations: map[string]*taskLocation{},
+	}
+	t.wheels[0] = NewWheel(10*time.Millisecond, 100, "ms")
+	t.wheels[1] = NewWheel(time.Second, 60, "s")
+	t.wheels[2] = NewWheel(time.Minute, 60, "m")
+	t.wheels[3] = NewWheel(time.Hour, 24, "h")
+	return t
+}
+
+func (tw *TimeWheel) Remove(key string) {
+	tw.removeC <- key
+}
+
+func (tw *TimeWheel) Add(key string, expireAt time.Time, job func()) {
+	tw.addC <- &task{
+		key:      key,
+		expireAt: expireAt,
+		job:      job,
+	}
 }
 
 func (tw *TimeWheel) Start() {
 	go func() {
 		for {
 			select {
-			case <-tw.mswheel.ticker.C:
-				tw.tick()
+			case <-tw.ticker.C:
+				tw.handleTick()
 			case t := <-tw.addC:
 				tw.add(t)
 			case key := <-tw.removeC:
@@ -59,135 +189,26 @@ func (tw *TimeWheel) Start() {
 	}()
 }
 
-func (tw *TimeWheel) Add(key string, expireAt time.Time, job func()) {
-	tw.addC <- &task{
-		key:      key,
-		expireAt: expireAt,
-		job:      job,
-	}
-}
-
-func (tw *TimeWheel) add(t *task) {
-	at := t.expireAt
-	milli := at.UnixMilli()
-	now := time.Now().UnixMilli()
-
-	if milli-now < int64(tw.mswheel.interval) {
-		tw.addTaskToWheel(t, tw.mswheel)
-	} else if milli-now < int64(tw.swheel.interval)*int64(tw.swheel.slotsNum) {
-		tw.addTaskToWheel(t, tw.swheel)
-	} else if milli-now < int64(tw.mwheel.interval)*int64(tw.mwheel.slotsNum) {
-		tw.addTaskToWheel(t, tw.mwheel)
-	} else if milli-now < int64(tw.hwheel.interval)*int64(tw.hwheel.slotsNum) {
-		tw.addTaskToWheel(t, tw.hwheel)
-	} else {
-		// If the task expires beyond the maximum interval supported by the time wheel, ignore the task.
-		return
-	}
-}
-
-func (tw *TimeWheel) addTaskToWheel(t *task, wheel *Wheel) {
-	pos := (wheel.current + uint32((t.expireAt.UnixMilli()-time.Now().UnixMilli())/int64(wheel.interval))) % wheel.slotsNum
-	b := wheel.slots[pos]
-	b.bucketLock.Lock()
-	back := b.list.PushBack(t)
-	b.bucketLock.Unlock()
-	tw.taskLocations[t.key] = &taskLocation{
-		elem: back,
-		slot: pos,
-	}
-}
-
-func (tw *TimeWheel) Remove(key string) {
-	tw.removeC <- key
-}
-
 func (tw *TimeWheel) remove(key string) {
-	loc, ok := tw.taskLocations[key]
-	if !ok {
-		return
-	}
-	delete(tw.taskLocations, key)
-	b := tw.mswheel.slots[loc.slot]
-	b.bucketLock.Lock()
-	b.list.Remove(loc.elem)
-	b.bucketLock.Unlock()
-}
-
-func (tw *TimeWheel) tick() {
-	tw.mswheel.tick()
-	if tw.mswheel.current == 0 {
-		tw.swheel.tick()
-		if tw.swheel.current == 0 {
-			tw.mwheel.tick()
-			if tw.mwheel.current == 0 {
-				tw.hwheel.tick()
-			}
-		}
+	if location, ok := tw.taskLocations[key]; ok {
+		wheel := tw.wheels[location.elem.Value.(*task).currentLevel]
+		wheel.slots[location.slot].bucketLock.Lock()
+		wheel.slots[location.slot].list.Remove(location.elem)
+		wheel.slots[location.slot].bucketLock.Unlock()
+		delete(tw.taskLocations, key)
 	}
 }
 
-func (tw *TimeWheel) stop() {
-	tw.mswheel.ticker.Stop()
-	close(tw.addC)
-	close(tw.removeC)
-	close(tw.stopC)
-	tw.taskLocations = nil
-
-}
-
-func (w *Wheel) tick() {
-	w.current = (w.current + 1) % w.slotsNum
-	b := w.slots[w.current]
-	b.bucketLock.Lock()
-	for e := b.list.Front(); e != nil; {
-		next := e.Next()
-		task := e.Value.(*task)
-		if task.expireAt.UnixMilli() <= time.Now().UnixMilli() {
-			go task.job()
-			b.list.Remove(e)
-		}
-		e = next
-	}
-	b.bucketLock.Unlock()
-}
-
-func NewWheel(interval time.Duration, slotsNum uint32) *Wheel {
-	w := &Wheel{
-		interval:        interval,
-		ticker:          time.NewTicker(interval),
-		slots:           make([]*bucket, slotsNum),
-		slotsNum:        slotsNum,
-		currentDuration: 0,
-		current:         0,
-	}
-	for i := range w.slots {
-		w.slots[i] = &bucket{
-			list: list.New(),
-		}
-	}
-	return w
-}
-func NewTimeWheel() *TimeWheel {
-	return &TimeWheel{
-		mswheel:       NewWheel(10*time.Millisecond, 100),
-		swheel:        NewWheel(time.Second, 60),
-		mwheel:        NewWheel(time.Minute, 60),
-		hwheel:        NewWheel(time.Hour, 24),
-		addC:          make(chan *task),
-		removeC:       make(chan string),
-		stopC:         make(chan struct{}),
-		taskLocations: map[string]*taskLocation{},
-	}
-
-}
 func main() {
 	tw := NewTimeWheel()
 	tw.Start()
 	start := time.Now()
 	// Add a task to the time wheel
+	tw.Add("task0", time.Now().Add(500*time.Millisecond), func() {
+		fmt.Printf("Task 0 executed now%s after 500 milliseconds which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+	})
 	tw.Add("task1", time.Now().Add(5*time.Second), func() {
-		fmt.Printf("Task 1 executed now%s which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+		fmt.Printf("Task 1 executed now%s after 5 second  which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
 	})
 
 	// Add another task to the time wheel
@@ -204,10 +225,26 @@ func main() {
 	tw.Add("task5", time.Now().Add(15*time.Minute), func() {
 		fmt.Printf("Task 5 executed now %s after 15 minutes which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
 	})
-	tw.Remove("task5")
-	tw.Remove("task4")
+	tw.Add("task6", time.Now().Add(30*time.Minute), func() {
+		fmt.Printf("Task 6 executed now %s after 30 minutes which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+	})
+	tw.Add("task7", time.Now().Add(1*time.Hour), func() {
+		fmt.Printf("Task 7 executed now %s after 1 hour which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+
+	})
+	tw.Add("task8", time.Now().Add(2*time.Hour), func() {
+		fmt.Printf("Task 8 executed now %s after 2 hours which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+		tw.Remove("task9")
+	})
+	tw.Add("task9", time.Now().Add(3*time.Hour+15*time.Minute+37*time.Second), func() {
+		fmt.Printf("Task 9 executed now %s after 3 hours which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+	})
+	tw.Add("task666", time.Now().Add(time.Minute+10*time.Second), func() {
+		fmt.Printf("Task666 executed now%s after 1 minute and 10 seconds which is start%s\n", time.Now().Format("2006-01-02-15-04-05"), start.Format("2006-01-02-15-04-05"))
+	})
+
 	// Sleep for a while to let tasks be executed
-	time.Sleep(25 * time.Second)
+	time.Sleep(2 * time.Minute)
 	// Stop the time wheel
 	tw.stopC <- struct{}{}
 }
